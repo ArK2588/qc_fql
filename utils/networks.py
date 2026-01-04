@@ -258,3 +258,24 @@ class ActorVectorField(nn.Module):
         v = self.mlp(inputs)
 
         return v
+
+class EntropyCoef(nn.Module):
+    ent_coef_init: float = 1.0
+
+    @nn.compact
+    def __call__(self) -> jnp.ndarray:
+        log_ent_coef = self.param(
+            "log_ent_coef",
+            init_fn=lambda _: jnp.full((), jnp.log(self.ent_coef_init)),
+        )
+        return jnp.exp(log_ent_coef)
+
+
+class ConstantEntropyCoef(nn.Module):
+    ent_coef_init: float = 1.0
+
+    @nn.compact
+    def __call__(self) -> float:
+        # Hack to not optimize the entropy coefficient while not having to use if/else for the jit
+        self.param("dummy_param", init_fn=lambda _: jnp.full((), self.ent_coef_init))
+        return self.ent_coef_init * 1.0  # force to float

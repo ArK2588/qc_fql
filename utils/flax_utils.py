@@ -5,6 +5,7 @@ import pickle
 from typing import Any, Dict, Mapping, Sequence
 
 import flax
+import flax.core
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -158,6 +159,17 @@ class TrainState(flax.struct.PyTreeNode):
 
         return self.apply_gradients(grads=grads), info
 
+class ActorTrainState(TrainState):
+    batch_stats: flax.core.FrozenDict
+    old_params: flax.core.FrozenDict
+
+class RLTrainState(TrainState):
+    batch_stats: flax.core.FrozenDict
+    target_params: flax.core.FrozenDict
+    target_batch_stats: flax.core.FrozenDict
+
+    def l2normalize(self) -> "RLTrainState":
+        return self.replace(params=_l2normalize_params(self.params))
 
 def save_agent(agent, save_dir, epoch):
     """Save the agent to a file.

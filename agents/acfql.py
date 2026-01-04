@@ -2,14 +2,17 @@ import copy
 from typing import Any
 
 import flax
+from flax.core import FrozenDict
 import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
 
+from utils.transformer_critic import EnsembleTransformerCritic
 from utils.encoders import encoder_modules
-from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import ActorVectorField, Value
+from utils.flax_utils import ModuleDict, TrainState, nonpytree_field, ActorTrainState, RLTrainState
+from utils.networks import ActorVectorField, Value, EntropyCoef, ConstantEntropyCoef
+from agents.chunky_fql import ChunkyFQLConfig
 
 class ACFQLAgent(flax.struct.PyTreeNode):
     """Flow Q-learning (FQL) agent with action chunking. 
@@ -18,10 +21,14 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     config: Any = nonpytree_field()
+    qf_state: RLTrainState
+    ent_coef_state: TrainState
 
     def critic_loss(self, batch, grad_params, rng):
         """Compute the FQL critic loss."""
-
+        if self.config["chunky_fql"]:
+            raise ValueError("Not intended route. Something broken")
+        
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
         else:
@@ -90,10 +97,13 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             
             # Q loss.
             actor_actions = jnp.clip(actor_actions, -1, 1)
-
-            qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
-            q = jnp.mean(qs, axis=0)
-            q_loss = -q.mean()
+            if not self.config["chunky_fql"]:
+                qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
+                q = jnp.mean(qs, axis=0)
+                q_loss = -q.mean()
+            else:
+                # TODO explore alternatives
+                q_loss = 0
         else:
             distill_loss = jnp.zeros(())
             q_loss = jnp.zeros(())
@@ -142,9 +152,84 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         def loss_fn(grad_params):
             return agent.total_loss(batch, grad_params, rng=rng)
+        
+        def actor_apply(variables, obs, mutable=None, train=False, deterministic=False, key=None, single_action=False):
+            # TODO
+            act = agent.sample_actions(obs, rng=key)
+            dummy_logp = jnp.zeros((agent.config["actor_chunksize"],))
+            return (act, dummy_logp, None, None), {}
 
-        new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
-        agent.target_update(new_network, 'critic')
+        if agent.config["chunky_fql"]:
+            cfg = ChunkyFQLConfig(
+                actor_chunksize=agent.config["actor_chunksize"],
+                single_action_v=agent.config.get("single_action_v", False),
+                n_critics=agent.config["num_qs"],
+                distributional=False,
+                update_ensemble_size=agent.config.get("update_ensemble_size", agent.config["num_qs"]),
+                only_fit_last_nstep=agent.config.get("only_fit_last_nstep", False),
+                actor_kind="flow",
+                apply_next_state_ent_bonus=agent.config.get("apply_next_state_ent_bonus", True),
+                simbav2=False,
+                use_bnstats_from_live_net=False,
+            )
+
+            info = {}
+            B, T, obs_dim = batch["full_observations"].shape
+            _, _, act_dim = batch["actions"].shape
+
+            chunky_observations = batch["full_observations"].reshape(B, T * obs_dim)
+            chunky_next_observations = batch["next_observations"].reshape(B, T * obs_dim)
+            chunky_actions = batch["actions"].reshape(B, T * act_dim)
+
+            # reconstructing step rewards from cumulative discounted rewards
+            discount = float(agent.config["discount"])
+            disc_pows = discount ** jnp.arange(T)
+            rewards_cum = batch["rewards"]  # (B, T)
+            r0 = rewards_cum[:, :1]
+            r_diff = rewards_cum[:, 1:] - rewards_cum[:, :-1]
+            r_step = jnp.concatenate([r0, r_diff], axis=1) / disc_pows  # (B, T)
+            term_cum = batch["terminals"]  # (B, T) cumulative max
+            d0 = term_cum[:, :1]
+            d_step = jnp.concatenate([d0, jnp.clip(term_cum[:, 1:] - term_cum[:, :-1], 0.0, 1.0)], axis=1)
+            chunky_rewards = r_step
+            chunky_dones = d_step
+            chunky_truncated = jnp.zeros_like(chunky_dones)
+
+            actor_state = ActorTrainState(
+            step=0,
+            apply_fn=actor_apply,
+            model_def=None,
+            params=FrozenDict(),
+            tx=None,
+            opt_state=None,
+            batch_stats=FrozenDict(),
+            old_params=FrozenDict(),
+            )
+
+            new_network = agent.network
+
+            qf_state, metrics, rng = cfg.update_chunky_critic(
+                gamma=float(agent.config["discount"]),
+                actor_state=actor_state,
+                qf_state=agent.qf_state,
+                ent_coef_state=agent.ent_coef_state,
+                chunky_observations=chunky_observations,
+                chunky_actions=chunky_actions,
+                chunky_rewards=chunky_rewards,
+                chunky_dones=chunky_dones,
+                chunky_truncated=chunky_truncated,
+                chunky_next_observations=chunky_next_observations,
+                key=rng,
+                sampler=None,
+            )
+
+            agent = agent.replace(qf_state=qf_state)
+            info.update({f"critic/{k}": v for k, v in metrics.items()})
+        
+        else:
+            new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
+            agent.target_update(new_network, 'critic')
+
         return agent.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
@@ -178,6 +263,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             actions = jnp.clip(actions, -1, 1)
 
         elif self.config["actor_type"] == "best-of-n":
+            if self.config['chunky_fql']:
+                raise ValueError("Chunky FQL not supported for best-of-n actor type")
             action_dim = self.config['action_dim'] * \
                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
             noises = jax.random.normal(
@@ -244,6 +331,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape
         action_dim = ex_actions.shape[-1]
+        if config["ent_coef_init"] == "auto":
+            ent_coef_module = EntropyCoef(config["ent_coef_init"])
+        else:
+            ent_coef_module = ConstantEntropyCoef(float(config["ent_coef_init"]))
+        ent_key, rng = jax.random.split(rng)
+        ent_coef_state = TrainState.create(
+            model_def=ent_coef_module,
+            params=ent_coef_module.init(ent_key)["params"],
+            tx=optax.adam(learning_rate=config["lr"]),
+        )
         if config["action_chunking"]:
             full_actions = jnp.concatenate([ex_actions] * config["horizon_length"], axis=-1)
         else:
@@ -259,12 +356,27 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             encoders['actor_onestep_flow'] = encoder_module()
 
         # Define networks.
-        critic_def = Value(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            num_ensembles=config['num_qs'],
-            encoder=encoders.get('critic'),
-        )
+        if config['chunky_fql']:
+            critic_def = EnsembleTransformerCritic(
+                n_critics=config["num_qs"],
+                n_embed=config["critic_n_embed"],
+                n_heads=config["critic_n_heads"],
+                n_layer=config["critic_n_layer"],
+                dropout_rate=config["critic_dropout_rate"],
+                block_size=config["critic_chunksize"] + 2,
+                relative_pos=True,
+                norm=config["critic_norm"],
+                weight_norm=config["critic_weight_norm"],
+                distributional=config["critic_distributional"],
+                n_atoms=config.get("critic_n_atoms", 0),
+            )
+        else:
+            critic_def = Value(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                num_ensembles=config['num_qs'],
+                encoder=encoders.get('critic'),
+            )
 
         actor_bc_flow_def = ActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
@@ -281,13 +393,33 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             encoder=encoders.get('actor_onestep_flow'),
         )
 
+        if config['chunky_fql']:
+            critic_key, rng = jax.random.split(rng)
+            ex_obs_b = jnp.expand_dims(ex_observations, 0)
+            ex_act_b = jnp.expand_dims(ex_actions, 0)
+            ex_chunky_actions = jnp.tile(ex_act_b[:, None, :], (1, config["critic_chunksize"], 1))
+            critic_vars = critic_def.init(critic_key, ex_obs_b, ex_chunky_actions, train=True)
+            qf_params = critic_vars["params"]
+            qf_batch_stats = critic_vars.get("batch_stats", FrozenDict())
+            qf_state = RLTrainState.create(
+                model_def=critic_def,
+                params=qf_params,
+                tx=optax.adam(config["lr"]),
+                batch_stats=qf_batch_stats,
+                target_params=qf_params,
+                target_batch_stats=qf_batch_stats,
+            )
+        else:
+            qf_state = None
+
         
         network_info = dict(
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
             actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, full_actions)),
-            critic=(critic_def, (ex_observations, full_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
         )
+        if not config['chunky_fql']:
+            network_info["critic"]=(critic_def, (ex_observations, full_actions))
+            network_info["target_critic"]=(copy.deepcopy(critic_def), (ex_observations, full_actions))
         if encoders.get('actor_bc_flow') is not None:
             # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
@@ -304,12 +436,13 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         params = network.params
 
-        params[f'modules_target_critic'] = params[f'modules_critic']
+        if not config["chunky_fql"]:
+            params[f'modules_target_critic'] = params[f'modules_critic']
 
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
 
-        return cls(rng, network=network, config=flax.core.FrozenDict(**config))
+        return cls(rng, network=network, qf_state=qf_state, ent_coef_state=ent_coef_state, config=flax.core.FrozenDict(**config))
 
 
 def get_config():
@@ -327,7 +460,7 @@ def get_config():
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
-            q_agg='mean',  # Aggregation method for target Q values.
+            q_agg='mean',  # Aggregation method for target Q values. Changed from mean
             alpha=100.0,  # BC coefficient (need to be tuned for each environment).
             num_qs=2, # critic ensemble size
             flow_steps=10,  # Number of flow steps.
@@ -340,6 +473,18 @@ def get_config():
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
+            chunky_fql=True,
+            ent_coef_init=1.0, # or 'auto'->not implemented yet
+            critic_n_embed=128, #Try 512 later
+            critic_n_heads=8,
+            critic_n_layer=2,
+            critic_dropout_rate=0.0,
+            critic_norm="ln",
+            critic_weight_norm=False,
+            critic_distributional=False,
+            critic_n_atoms=0,
+            critic_chunksize=5,
+            actor_chunksize=5,
         )
     )
     return config

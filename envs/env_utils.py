@@ -57,7 +57,7 @@ class EpisodeMonitor(gymnasium.Wrapper):
         return self.env.reset(*args, **kwargs)
 
 
-class FrameStackWrapper(gymnasium.Wrapper):
+class FrameStackWrapper(gymnasium.Wrapper): #note
     """Environment wrapper to stack observations."""
 
     def __init__(self, env, num_stack):
