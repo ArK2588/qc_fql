@@ -76,6 +76,11 @@ class ChunkyFQLConfig:
             discounted_accumulated_reward = discounted_accumulated_reward[
                 :, -1
             ].reshape((batch_size, 1))
+        
+        chunk_len = chunky_next_observations.shape[1]
+        q_target_keys = jax.random.split(next_action_key, batch_size * chunk_len).reshape(
+            batch_size, chunk_len, 2
+        )
 
         q_target = self.calculate_q_target(
             gamma,
@@ -85,7 +90,7 @@ class ChunkyFQLConfig:
             actor_state,
             qf_state,
             ent_coef_value if self.apply_next_state_ent_bonus else 0.0,
-            next_action_key,
+            q_target_keys,
             self.use_bnstats_from_live_net,
             sampler,
             action_size,
@@ -166,11 +171,11 @@ class ChunkyFQLConfig:
 
     #@staticmethod
     @partial(
-        jax.vmap, in_axes=(None, None, 0, 0, 0, None, None, None, None, None, None, None)
-        )  # batch
+        jax.vmap, in_axes=(None, None, 0, 0, 0, None, None, None, 0, None, None, None)
+    )  # batch
     @partial(
-        jax.vmap, in_axes=(None, None, 0, 0, 0, None, None, None, None, None, None, None)
-        )  # chunk
+        jax.vmap, in_axes=(None, None, 0, 0, 0, None, None, None, 0, None, None, None)
+    )  # chunk
     def calculate_q_target(
         self,
         gamma: Union[float, Scalar],

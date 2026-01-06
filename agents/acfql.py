@@ -102,8 +102,30 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 q = jnp.mean(qs, axis=0)
                 q_loss = -q.mean()
             else:
-                # TODO explore alternatives
-                q_loss = 0
+                # TODO verify later
+                T = self.config["horizon_length"]
+                act_dim = self.config["action_dim"]
+                chunk_actions = actor_actions.reshape(batch_size, T, act_dim)
+
+                q_vals = self.qf_state.apply_fn(
+                    {"params": self.qf_state.params, "batch_stats": self.qf_state.batch_stats},
+                    batch["observations"],
+                    chunk_actions,
+                    False,
+                )
+
+                q_last = q_vals[:, :, -1]
+
+                if self.config["q_agg"] == "min":
+                    q = jnp.min(q_last, axis=0)
+                else:
+                    q = jnp.mean(q_last, axis=0)
+
+                # counting examples where the final step in chunk is valid
+                w = batch["valid"][..., -1] 
+                q = (q * w).sum() / (w.sum() + 1e-8)
+
+                q_loss = -q
         else:
             distill_loss = jnp.zeros(())
             q_loss = jnp.zeros(())
@@ -115,6 +137,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             'actor_loss': actor_loss,
             'bc_flow_loss': bc_flow_loss,
             'distill_loss': distill_loss,
+            'q_loss':q_loss,
         }
 
     @jax.jit
@@ -153,11 +176,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         def loss_fn(grad_params):
             return agent.total_loss(batch, grad_params, rng=rng)
         
-        def actor_apply(variables, obs, mutable=None, train=False, deterministic=False, key=None, single_action=False):
-            # TODO
-            act = agent.sample_actions(obs, rng=key)
-            dummy_logp = jnp.zeros((agent.config["actor_chunksize"],))
-            return (act, dummy_logp, None, None), {}
+        def actor_loss_fn(grad_params):
+            actor_loss, actor_info = agent.actor_loss(batch, grad_params, actor_key)
+            return actor_loss, actor_info
 
         if agent.config["chunky_fql"]:
             cfg = ChunkyFQLConfig(
@@ -195,6 +216,18 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             chunky_dones = d_step
             chunky_truncated = jnp.zeros_like(chunky_dones)
 
+            critic_key, actor_key = jax.random.split(rng)
+            new_network, actor_metrics = agent.network.apply_loss_fn(loss_fn=actor_loss_fn)
+            agent = agent.replace(network=new_network)
+            info.update({f"actor/{k}": v for k, v in actor_metrics.items()})
+
+            def actor_apply(variables, obs, mutable=None, train=False, deterministic=False, key=None, single_action=False):
+                # TODO
+                act = agent.sample_actions(obs, rng=key)
+                dummy_logp = jnp.zeros((agent.config["actor_chunksize"],))
+                return (act, dummy_logp, None, None), {}
+
+
             actor_state = ActorTrainState(
             step=0,
             apply_fn=actor_apply,
@@ -205,8 +238,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             batch_stats=FrozenDict(),
             old_params=FrozenDict(),
             )
-
-            new_network = agent.network
 
             qf_state, metrics, rng = cfg.update_chunky_critic(
                 gamma=float(agent.config["discount"]),
@@ -219,18 +250,19 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 chunky_dones=chunky_dones,
                 chunky_truncated=chunky_truncated,
                 chunky_next_observations=chunky_next_observations,
-                key=rng,
+                key=critic_key,
                 sampler=None,
             )
 
             agent = agent.replace(qf_state=qf_state)
             info.update({f"critic/{k}": v for k, v in metrics.items()})
-        
+            return agent.replace(rng=new_rng), info
+
         else:
             new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
             agent.target_update(new_network, 'critic')
+            return agent.replace(network=new_network, rng=new_rng), info
 
-        return agent.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
     def update(self, batch):
