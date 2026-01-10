@@ -55,7 +55,10 @@ class ChunkyFQLConfig:
         chunky_actions = chunky_actions.reshape((batch_size, chunk_size, action_size))
         ent_coef_value = ent_coef_state.apply_fn({"params": ent_coef_state.params})
 
-        next_state_v_mask = jnp.logical_not(chunky_dones)
+        # resolving truncation vs done
+        done = chunky_dones.astype(bool)
+        trunc = chunky_truncated.astype(bool)
+        next_state_v_mask = 1.0 - jnp.logical_and(done, jnp.logical_not(trunc))
         next_state_v_scale = next_state_v_mask * gamma ** jnp.arange(
             1, critic_chunksize + 1
         )
@@ -161,10 +164,10 @@ class ChunkyFQLConfig:
             "critic_grad_norm": optax.global_norm(grads),
             "critic_param_norm": optax.global_norm(qf_state.params),
             "critic_loss": qf_loss_value,
-            "ent_coef": ent_coef_value,
+            #"ent_coef": ent_coef_value,
             "current_q_values": current_q_values.mean(),
             "next_q_values": next_q_values.mean(),
-            "nonfinite_next_state_logprobs": nonfinite_next_state_logprobs,
+            #"nonfinite_next_state_logprobs": nonfinite_next_state_logprobs,
         }
 
         return (qf_state, metrics, key)
@@ -218,8 +221,7 @@ class ChunkyFQLConfig:
                 key=next_action_key,
                 single_action=self.single_action_v,
             )
-            # discount = gamma ** jnp.arange(0, self.actor_chunksize)
-            # next_action_logprob = jnp.sum(next_chunky_logprobs * discount)
+            # next_action_logprob set to 0 since we cannot estimate it for our flow actor
             next_action_logprob = jnp.array(0.0)
         
         # calculate the q-value of the next-state action
@@ -277,6 +279,7 @@ class ChunkyFQLConfig:
             # we estimate the next state value using the return of the whole chunk
             q_value = q_value[-1]
 
+            # ent_coef term will be effectively ignored
             next_state_v = q_value - ent_coef_value * next_action_logprob
 
             return reward + next_state_v_scale * next_state_v

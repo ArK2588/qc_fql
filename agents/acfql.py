@@ -189,7 +189,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 update_ensemble_size=agent.config.get("update_ensemble_size", agent.config["num_qs"]),
                 only_fit_last_nstep=agent.config.get("only_fit_last_nstep", False),
                 actor_kind="flow",
-                apply_next_state_ent_bonus=agent.config.get("apply_next_state_ent_bonus", True),
+                apply_next_state_ent_bonus=agent.config.get("apply_next_state_ent_bonus", False), # ignore entropy bonus for flow actor
                 simbav2=False,
                 use_bnstats_from_live_net=False,
             )
@@ -214,7 +214,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             d_step = jnp.concatenate([d0, jnp.clip(term_cum[:, 1:] - term_cum[:, :-1], 0.0, 1.0)], axis=1)
             chunky_rewards = r_step
             chunky_dones = d_step
-            chunky_truncated = jnp.zeros_like(chunky_dones)
+            chunky_truncated = chunky_dones * batch["masks"] # batch masks is (B,T) cumalative min
 
             critic_key, actor_key = jax.random.split(rng)
             new_network, actor_metrics = agent.network.apply_loss_fn(loss_fn=actor_loss_fn)
@@ -224,6 +224,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             def actor_apply(variables, obs, mutable=None, train=False, deterministic=False, key=None, single_action=False):
                 # TODO
                 act = agent.sample_actions(obs, rng=key)
+                # QC_FQL actor uses a noise-conditioned policy so we can't calculate proper logprobs.
+                # We just retiurn dummy values for compatibility
                 dummy_logp = jnp.zeros((agent.config["actor_chunksize"],))
                 return (act, dummy_logp, None, None), {}
 
@@ -252,6 +254,19 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 chunky_next_observations=chunky_next_observations,
                 key=critic_key,
                 sampler=None,
+            )
+
+            # target network update for chunky critic
+            tau = float(agent.config["tau"])
+            new_target_params = jax.tree_util.tree_map(
+                lambda p, tp: tau * p + (1.0 - tau) * tp,
+                qf_state.params,
+                qf_state.target_params,
+            )
+            new_target_batch_stats = qf_state.batch_stats
+            qf_state = qf_state.replace(
+                target_params=new_target_params,
+                target_batch_stats=new_target_batch_stats,
             )
 
             agent = agent.replace(qf_state=qf_state)

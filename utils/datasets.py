@@ -89,27 +89,68 @@ class Dataset(FrozenDict):
                 self.augment(batch, ['observations', 'next_observations'])
         return batch
 
-    def sample_sequence(self, batch_size, sequence_length, discount):
-        idxs = np.random.randint(self.size - sequence_length + 1, size=batch_size)
-        
-        data = {k: v[idxs] for k, v in self.items()}
+    def sample_sequence(self, batch_size, sequence_length, discount, chunky_buffer_style = False, bias = 0.0):
+        if not chunky_buffer_style:
+            idxs = np.random.randint(self.size - sequence_length + 1, size=batch_size)
+            
+            data = {k: v[idxs] for k, v in self.items()}
 
-        # Pre-compute all required indices
-        all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]  # (batch_size, sequence_length)
-        all_idxs = all_idxs.flatten()
+            # Pre-compute all required indices
+            all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]  # (batch_size, sequence_length)
+            all_idxs = all_idxs.flatten()
+
+            # Batch fetch data to avoid loops
+            batch_observations = self['observations'][all_idxs].reshape(batch_size, sequence_length, *self['observations'].shape[1:])
+            batch_next_observations = self['next_observations'][all_idxs].reshape(batch_size, sequence_length, *self['next_observations'].shape[1:])
+            batch_actions = self['actions'][all_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
+            batch_rewards = self['rewards'][all_idxs].reshape(batch_size, sequence_length, *self['rewards'].shape[1:])
+            batch_masks = self['masks'][all_idxs].reshape(batch_size, sequence_length, *self['masks'].shape[1:])
+            batch_terminals = self['terminals'][all_idxs].reshape(batch_size, sequence_length, *self['terminals'].shape[1:])
+
+            # Calculate next_actions
+            next_action_idxs = np.minimum(all_idxs + 1, self.size - 1)
+            batch_next_actions = self['actions'][next_action_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
         
-        # Batch fetch data to avoid loops
-        batch_observations = self['observations'][all_idxs].reshape(batch_size, sequence_length, *self['observations'].shape[1:])
-        batch_next_observations = self['next_observations'][all_idxs].reshape(batch_size, sequence_length, *self['next_observations'].shape[1:])
-        batch_actions = self['actions'][all_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
-        batch_rewards = self['rewards'][all_idxs].reshape(batch_size, sequence_length, *self['rewards'].shape[1:])
-        batch_masks = self['masks'][all_idxs].reshape(batch_size, sequence_length, *self['masks'].shape[1:])
-        batch_terminals = self['terminals'][all_idxs].reshape(batch_size, sequence_length, *self['terminals'].shape[1:])
-        
-        # Calculate next_actions
-        next_action_idxs = np.minimum(all_idxs + 1, self.size - 1)
-        batch_next_actions = self['actions'][next_action_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
-        
+        else:
+            term = self["terminals"].squeeze()  # (N,)
+            max_i = self.size
+
+            new_episode = np.flatnonzero(term[:max_i] > 0) + 1  # indices after episode end transitions
+
+            episode_start = np.empty((new_episode.size + 1,), dtype=np.int64)
+            episode_start[0] = 0
+            episode_start[1:] = new_episode
+
+            episode_end = np.empty((new_episode.size + 1,), dtype=np.int64)
+            episode_end[:-1] = new_episode
+            episode_end[-1] = max_i
+
+            valid_eps = np.flatnonzero(episode_end - episode_start >= sequence_length)
+            assert valid_eps.size, "No episodes long enough for sequence length"
+
+            ep_idx = np.random.choice(valid_eps, size=batch_size, replace=True)
+
+            max_offset = episode_end[ep_idx] - episode_start[ep_idx] - sequence_length
+            # sample uniform start offsets per element
+            offset = (np.random.rand(batch_size) * (max_offset + 1)).astype(np.int64)
+
+            idxs = episode_start[ep_idx] + offset  # start indices, shape (B,)
+            all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]  # (B,T)
+            flat = all_idxs.reshape(-1)
+
+            # Batch fetch data to avoid loops
+            batch_observations = self['observations'][flat].reshape(batch_size, sequence_length, *self['observations'].shape[1:])
+            batch_next_observations = self['next_observations'][flat].reshape(batch_size, sequence_length, *self['next_observations'].shape[1:])
+            batch_actions = self['actions'][flat].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
+            batch_rewards = self['rewards'][flat].reshape(batch_size, sequence_length, *self['rewards'].shape[1:])
+            batch_masks = self['masks'][flat].reshape(batch_size, sequence_length, *self['masks'].shape[1:])
+            batch_terminals = self['terminals'][flat].reshape(batch_size, sequence_length, *self['terminals'].shape[1:])
+
+            # Calculate next_actions
+            batch_next_actions = np.concatenate([batch_actions[:, 1:, :], batch_actions[:, -1:, :]], axis=1)
+
+            data = {k: v[idxs] for k, v in self.items()}
+            
         # Use vectorized operations to calculate cumulative rewards and masks
         rewards = np.zeros((batch_size, sequence_length), dtype=float)
         masks = np.ones((batch_size, sequence_length), dtype=float)
